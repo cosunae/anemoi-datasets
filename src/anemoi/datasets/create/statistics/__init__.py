@@ -126,11 +126,10 @@ def compute_statistics(array, check_variables_names=None, allow_nan=False):
         # Ignore NaN values
         minimum[i] = np.nanmin(values, axis=1)
         maximum[i] = np.nanmax(values, axis=1)
-        sums[i] = np.nansum(values, axis=1)
-        squares[i] = np.nansum(values * values, axis=1)
+        sums[i] = np.nansum(values, axis=1, dtype=np.float64)
+        squares[i] = np.nansum(values * values, axis=1, dtype=np.float64)
         count[i] = np.sum(~np.isnan(values), axis=1)
         has_nans[i] = np.isnan(values).any()
-
     return {
         "minimum": minimum,
         "maximum": maximum,
@@ -289,18 +288,19 @@ class StatAggregator:
     def aggregate(self):
         minimum = np.nanmin(self.minimum, axis=0)
         maximum = np.nanmax(self.maximum, axis=0)
-        sums = np.nansum(self.sums, axis=0)
-        squares = np.nansum(self.squares, axis=0)
+        sums = np.nansum(self.sums, axis=0, dtype=np.float64)
+        squares = np.nansum(self.squares, axis=0, dtype=np.float64)
         count = np.nansum(self.count, axis=0)
         has_nans = np.any(self.has_nans, axis=0)
         mean = sums / count
-
         assert sums.shape == count.shape == squares.shape == mean.shape == minimum.shape == maximum.shape
 
         x = squares / count - mean * mean
+        x[x < 0] = 0
         # remove negative variance due to numerical errors
         # x[- 1e-15 < (x / (np.sqrt(squares / count) + np.abs(mean))) < 0] = 0
         check_variance(x, self.variables_names, minimum, maximum, mean, count, sums, squares)
+       
         stdev = np.sqrt(x)
 
         for j, name in enumerate(self.variables_names):

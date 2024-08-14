@@ -695,6 +695,7 @@ class GenericAdditions(GenericDatasetHandler):
         assert sums.shape == mean.shape
 
         x = squares / count - mean * mean
+        x[x < 0] = 0
         # remove negative variance due to numerical errors
         # x[- 1e-15 < (x / (np.sqrt(squares / count) + np.abs(mean))) < 0] = 0
         check_variance(x, self.variables, minimum, maximum, mean, count, sums, squares)
