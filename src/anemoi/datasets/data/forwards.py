@@ -23,7 +23,7 @@ LOG = logging.getLogger(__name__)
 
 class Forwards(Dataset):
     def __init__(self, forward):
-        self.forward = forward
+        self.forward = forward.mutate()
 
     def __len__(self):
         return len(self.forward)
@@ -118,6 +118,9 @@ class Combined(Forwards):
         # Forward most properties to the first dataset
         super().__init__(datasets[0])
 
+    def mutate(self):
+        return self
+
     def check_same_resolution(self, d1, d2):
         if d1.resolution != d2.resolution:
             raise ValueError(f"Incompatible resolutions: {d1.resolution} and {d2.resolution} ({d1} {d2})")
@@ -187,14 +190,9 @@ class Combined(Forwards):
             **kwargs,
         )
 
-    @cached_property
+    @property
     def missing(self):
-        offset = 0
-        result = set()
-        for d in self.datasets:
-            result.update(offset + m for m in d.missing)
-            offset += len(d)
-        return result
+        raise NotImplementedError("missing() not implemented for Combined")
 
     def get_dataset_names(self, names):
         for d in self.datasets:
@@ -249,3 +247,14 @@ class GivenAxis(Combined):
             return self._get_slice(n)
 
         return np.concatenate([d[n] for d in self.datasets], axis=self.axis - 1)
+
+    @cached_property
+    def missing(self):
+        offset = 0
+        result = set()
+        for d in self.datasets:
+            print("--->", d.missing, d)
+            result.update(offset + m for m in d.missing)
+            if self.axis == 0:  # Advance if axis is time
+                offset += len(d)
+        return result

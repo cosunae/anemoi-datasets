@@ -79,6 +79,37 @@ def to_datetimes(dates):
     return [to_datetime(d) for d in dates]
 
 
+def fix_variance(x, name, count, sums, squares):
+    assert count.shape == sums.shape == squares.shape
+    assert isinstance(x, float)
+
+    mean = sums / count
+    assert mean.shape == count.shape
+
+    if x >= 0:
+        return x
+
+    LOG.warning(f"Negative variance for {name=}, variance={x}")
+    magnitude = np.sqrt((squares / count + mean * mean) / 2)
+    LOG.warning(f"square / count - mean * mean =  {squares/count} - {mean*mean} = {squares/count - mean*mean}")
+    LOG.warning(f"Variable span order of magnitude is {magnitude}.")
+    LOG.warning(f"Count is {count}.")
+
+    variances = squares / count - mean * mean
+    assert variances.shape == squares.shape == mean.shape
+    if all(variances >= 0):
+        LOG.warning(f"All individual variances for {name} are positive, setting variance to 0.")
+        return 0
+
+    # if abs(x) < magnitude * 1e-6 and abs(x) < range * 1e-6:
+    #     LOG.warning("Variance is negative but very small.")
+    #     variances = squares / count - mean * mean
+    #     return 0
+
+    LOG.warning(f"ERROR at least one individual variance is negative ({np.nanmin(variances)}).")
+    return x
+
+
 def check_variance(x, variables_names, minimum, maximum, mean, count, sums, squares):
     if (x >= 0).all():
         return
@@ -89,20 +120,23 @@ def check_variance(x, variables_names, minimum, maximum, mean, count, sums, squa
             continue
         print("---")
         print(f"❗ Negative variance for {name=}, variance={y}")
-        print(f" max={maximum[i]} min={minimum[i]} mean={mean[i]} count={count[i]} sum={sums[i]} square={squares[i]}")
+        print(f" min={minimum[i]} max={maximum[i]} mean={mean[i]} count={count[i]} sums={sums[i]} squares={squares[i]}")
         print(f" -> sums: min={np.min(sums[i])}, max={np.max(sums[i])}, argmin={np.argmin(sums[i])}")
         print(f" -> squares: min={np.min(squares[i])}, max={np.max(squares[i])}, argmin={np.argmin(squares[i])}")
         print(f" -> count: min={np.min(count[i])}, max={np.max(count[i])}, argmin={np.argmin(count[i])}")
+        print(
+            f" squares / count - mean * mean =  {squares[i] / count[i]} - {mean[i] * mean[i]} = {squares[i] / count[i] - mean[i] * mean[i]}"
+        )
 
     raise ValueError("Negative variance")
 
 
-def compute_statistics(array, check_variables_names=None, allow_nan=False):
+def compute_statistics(array, check_variables_names=None, allow_nans=False):
     """Compute statistics for a given array, provides minimum, maximum, sum, squares, count and has_nans as a dictionary."""
 
     nvars = array.shape[1]
 
-    LOG.info(f"Stats {nvars}, {array.shape}, {check_variables_names}")
+    LOG.debug(f"Stats {nvars}, {array.shape}, {check_variables_names}")
     if check_variables_names:
         assert nvars == len(check_variables_names), (nvars, check_variables_names)
     stats_shape = (array.shape[0], nvars)
@@ -118,10 +152,10 @@ def compute_statistics(array, check_variables_names=None, allow_nan=False):
         values = chunk.reshape((nvars, -1))
 
         for j, name in enumerate(check_variables_names):
-            check_data_values(values[j, :], name=name, allow_nan=allow_nan)
+            check_data_values(values[j, :], name=name, allow_nans=allow_nans)
             if np.isnan(values[j, :]).all():
                 # LOG.warning(f"All NaN values for {name} ({j}) for date {i}")
-                raise ValueError(f"All NaN values for {name} ({j}) for date {i}")
+                LOG.warning(f"All NaN values for {name} ({j}) for date {i}")
 
         # Ignore NaN values
         minimum[i] = np.nanmin(values, axis=1)
@@ -178,12 +212,12 @@ class TmpStatistics:
             pickle.dump((key, dates, data), f)
         shutil.move(tmp_path, path)
 
-        LOG.info(f"Written statistics data for {len(dates)} dates in {path} ({dates})")
+        LOG.debug(f"Written statistics data for {len(dates)} dates in {path} ({dates})")
 
     def _gather_data(self):
         # use glob to read all pickles
         files = glob.glob(self.dirname + "/*.npz")
-        LOG.info(f"Reading stats data, found {len(files)} files in {self.dirname}")
+        LOG.debug(f"Reading stats data, found {len(files)} files in {self.dirname}")
         assert len(files) > 0, f"No files found in {self.dirname}"
         for f in files:
             with open(f, "rb") as f:
@@ -210,17 +244,17 @@ def normalise_dates(dates):
 class StatAggregator:
     NAMES = ["minimum", "maximum", "sums", "squares", "count", "has_nans"]
 
-    def __init__(self, owner, dates, variables_names, allow_nan):
+    def __init__(self, owner, dates, variables_names, allow_nans):
         dates = sorted(dates)
         dates = to_datetimes(dates)
         assert dates, "No dates selected"
         self.owner = owner
         self.dates = dates
         self.variables_names = variables_names
-        self.allow_nan = allow_nan
+        self.allow_nans = allow_nans
 
         self.shape = (len(self.dates), len(self.variables_names))
-        LOG.info(f"Aggregating statistics on shape={self.shape}. Variables : {self.variables_names}")
+        LOG.debug(f"Aggregating statistics on shape={self.shape}. Variables : {self.variables_names}")
 
         self.minimum = np.full(self.shape, np.nan, dtype=np.float64)
         self.maximum = np.full(self.shape, np.nan, dtype=np.float64)
@@ -283,28 +317,42 @@ class StatAggregator:
             assert d in found, f"Statistics for date {d} not precomputed."
         assert len(self.dates) == len(found), "Not all dates found in precomputed statistics"
         assert len(self.dates) == offset, "Not all dates found in precomputed statistics."
-        LOG.info(f"Statistics for {len(found)} dates found.")
+        LOG.debug(f"Statistics for {len(found)} dates found.")
 
     def aggregate(self):
         minimum = np.nanmin(self.minimum, axis=0)
         maximum = np.nanmax(self.maximum, axis=0)
-        sums = np.nansum(self.sums, axis=0, dtype=np.float64)
-        squares = np.nansum(self.squares, axis=0, dtype=np.float64)
+
+        sums = np.nansum(self.sums, axis=0)
+        squares = np.nansum(self.squares, axis=0)
         count = np.nansum(self.count, axis=0)
         has_nans = np.any(self.has_nans, axis=0)
+        assert sums.shape == count.shape == squares.shape == minimum.shape == maximum.shape
+
         mean = sums / count
-        assert sums.shape == count.shape == squares.shape == mean.shape == minimum.shape == maximum.shape
+        assert mean.shape == minimum.shape
 
         x = squares / count - mean * mean
-        x[x < 0] = 0
-        # remove negative variance due to numerical errors
-        # x[- 1e-15 < (x / (np.sqrt(squares / count) + np.abs(mean))) < 0] = 0
-        check_variance(x, self.variables_names, minimum, maximum, mean, count, sums, squares)
-       
-        stdev = np.sqrt(x)
+        assert x.shape == minimum.shape
 
-        for j, name in enumerate(self.variables_names):
-            check_data_values(np.array([mean[j]]), name=name, allow_nan=False)
+        for i, name in enumerate(self.variables_names):
+            # remove negative variance due to numerical errors
+            x[i] = fix_variance(x[i], name, self.count[i : i + 1], self.sums[i : i + 1], self.squares[i : i + 1])
+
+        for i, name in enumerate(self.variables_names):
+            check_variance(
+                x[i : i + 1],
+                [name],
+                minimum[i : i + 1],
+                maximum[i : i + 1],
+                mean[i : i + 1],
+                count[i : i + 1],
+                sums[i : i + 1],
+                squares[i : i + 1],
+            )
+            check_data_values(np.array([mean[i]]), name=name, allow_nans=False)
+
+        stdev = np.sqrt(x)
 
         return Summary(
             minimum=minimum,

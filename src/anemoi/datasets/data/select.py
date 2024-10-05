@@ -40,6 +40,12 @@ class Select(Forwards):
         # Forward other properties to the main dataset
         super().__init__(dataset)
 
+    def clone(self, dataset):
+        return self.__class__(dataset, self.indices, self.reason).mutate()
+
+    def mutate(self):
+        return self.forward.swap_with_parent(parent=self)
+
     @debug_indexing
     @expand_list_indexing
     def _get_tuple(self, index):
@@ -101,7 +107,7 @@ class Rename(Forwards):
     def __init__(self, dataset, rename):
         super().__init__(dataset)
         for n in rename:
-            assert n in dataset.variables
+            assert n in dataset.variables, n
         self._variables = [rename.get(v, v) for v in dataset.variables]
         self.rename = rename
 

@@ -149,7 +149,7 @@ class Version:
         print()
         print(f'📅 Start      : {self.first_date.strftime("%Y-%m-%d %H:%M")}')
         print(f'📅 End        : {self.last_date.strftime("%Y-%m-%d %H:%M")}')
-        print(f"⏰ Frequency  : {self.frequency}h")
+        print(f"⏰ Frequency  : {self.frequency}")
         if self.n_missing_dates is not None:
             print(f"🚫 Missing    : {self.n_missing_dates:,}")
         print(f"🌎 Resolution : {self.resolution}")
@@ -217,7 +217,7 @@ class Version:
         if total_size is not None:
             print(f"💽 Size       : {bytes(total_size)} ({bytes_to_human(total_size)})")
         if n is not None:
-            print(f"📁 Files      : {n}")
+            print(f"📁 Files      : {n:,}")
 
     @property
     def statistics(self):
@@ -311,7 +311,7 @@ class Version:
                 print(f"🕰️  Dataset initialized {when(start)}.")
                 if built and latest:
                     speed = (latest - start) / built
-                    eta = datetime.datetime.utcnow() + speed * (total - built)
+                    eta = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) + speed * (total - built)
                     print(f"🏁 ETA {when(eta)}.")
         else:
             if latest:

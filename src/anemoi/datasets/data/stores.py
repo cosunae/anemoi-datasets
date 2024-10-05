@@ -5,13 +5,16 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
+
 import logging
 import os
 import warnings
 from functools import cached_property
+from urllib.parse import urlparse
 
 import numpy as np
 import zarr
+from anemoi.utils.dates import frequency_to_timedelta
 
 from . import MissingDateError
 from .dataset import Dataset
@@ -40,7 +43,9 @@ class ReadOnlyStore(zarr.storage.BaseStore):
 
 
 class HTTPStore(ReadOnlyStore):
-    """We write our own HTTPStore because the one used by zarr (fsspec) does not play well with fork() and multiprocessing."""
+    """We write our own HTTPStore because the one used by zarr (s3fs)
+    does not play well with fork() and multiprocessing.
+    """
 
     def __init__(self, url):
         self.url = url
@@ -58,17 +63,16 @@ class HTTPStore(ReadOnlyStore):
 
 
 class S3Store(ReadOnlyStore):
-    """We write our own S3Store because the one used by zarr (fsspec)
-    does not play well with fork() and multiprocessing. Also, we get
-    to control the s3 client.
+    """We write our own S3Store because the one used by zarr (s3fs)
+    does not play well with fork(). We also get to control the s3 client
+    options using the anemoi configs.
     """
 
-    def __init__(self, url):
+    def __init__(self, url, region=None):
         from anemoi.utils.s3 import s3_client
 
         _, _, self.bucket, self.key = url.split("/", 3)
-
-        self.s3 = s3_client(self.bucket)
+        self.s3 = s3_client(self.bucket, region=region)
 
     def __getitem__(self, key):
         try:
@@ -80,6 +84,8 @@ class S3Store(ReadOnlyStore):
 
 
 class DebugStore(ReadOnlyStore):
+    """A store to debug the zarr loading."""
+
     def __init__(self, store):
         assert not isinstance(store, DebugStore)
         self.store = store
@@ -101,15 +107,27 @@ class DebugStore(ReadOnlyStore):
         return key in self.store
 
 
-def open_zarr(path, dont_fail=False, cache=None):
-    try:
-        store = path
+def name_to_zarr_store(path_or_url):
+    store = path_or_url
 
-        if store.startswith("http://") or store.startswith("https://"):
+    if store.startswith("s3://"):
+        store = S3Store(store)
+
+    elif store.startswith("http://") or store.startswith("https://"):
+        parsed = urlparse(store)
+        bits = parsed.netloc.split(".")
+        if len(bits) == 5 and (bits[1], bits[3], bits[4]) == ("s3", "amazonaws", "com"):
+            s3_url = f"s3://{bits[0]}{parsed.path}"
+            store = S3Store(s3_url, region=bits[2])
+        else:
             store = HTTPStore(store)
 
-        elif store.startswith("s3://"):
-            store = S3Store(store)
+    return store
+
+
+def open_zarr(path, dont_fail=False, cache=None):
+    try:
+        store = name_to_zarr_store(path)
 
         if DEBUG_ZARR_LOADING:
             if isinstance(store, str):
@@ -117,7 +135,8 @@ def open_zarr(path, dont_fail=False, cache=None):
 
                 if not os.path.isdir(store):
                     raise NotImplementedError(
-                        "DEBUG_ZARR_LOADING is only implemented for DirectoryStore. Please disable it for other backends."
+                        "DEBUG_ZARR_LOADING is only implemented for DirectoryStore. "
+                        "Please disable it for other backends."
                     )
                 store = zarr.storage.DirectoryStore(store)
             store = DebugStore(store)
@@ -132,6 +151,8 @@ def open_zarr(path, dont_fail=False, cache=None):
 
 
 class Zarr(Dataset):
+    """A zarr dataset."""
+
     def __init__(self, path):
         if isinstance(path, zarr.hierarchy.Group):
             self.was_zarr = True
@@ -228,14 +249,20 @@ class Zarr(Dataset):
             delta = self.frequency
         if isinstance(delta, int):
             delta = f"{delta}h"
-        from anemoi.datasets.create.loaders import TendenciesStatisticsAddition
+        from anemoi.utils.dates import frequency_to_string
+        from anemoi.utils.dates import frequency_to_timedelta
 
-        func = TendenciesStatisticsAddition.final_storage_name_from_delta
+        delta = frequency_to_timedelta(delta)
+        delta = frequency_to_string(delta)
+
+        def func(k):
+            return f"statistics_tendencies_{delta}_{k}"
+
         return dict(
-            mean=self.z[func("mean", delta)][:],
-            stdev=self.z[func("stdev", delta)][:],
-            maximum=self.z[func("maximum", delta)][:],
-            minimum=self.z[func("minimum", delta)][:],
+            mean=self.z[func("mean")][:],
+            stdev=self.z[func("stdev")][:],
+            maximum=self.z[func("maximum")][:],
+            minimum=self.z[func("minimum")][:],
         )
 
     @property
@@ -253,12 +280,11 @@ class Zarr(Dataset):
     @property
     def frequency(self):
         try:
-            return self.z.attrs["frequency"]
+            return frequency_to_timedelta(self.z.attrs["frequency"])
         except KeyError:
             LOG.warning("No 'frequency' in %r, computing from 'dates'", self)
         dates = self.dates
-        delta = dates[1].astype(object) - dates[0].astype(object)
-        return int(delta.total_seconds() / 3600)
+        return dates[1].astype(object) - dates[0].astype(object)
 
     @property
     def name_to_index(self):
@@ -307,11 +333,13 @@ class Zarr(Dataset):
 
 
 class ZarrWithMissingDates(Zarr):
+    """A zarr dataset with missing dates."""
+
     def __init__(self, path):
         super().__init__(path)
 
         missing_dates = self.z.attrs.get("missing_dates", [])
-        missing_dates = [np.datetime64(x) for x in missing_dates]
+        missing_dates = set([np.datetime64(x) for x in missing_dates])
         self.missing_to_dates = {i: d for i, d in enumerate(self.dates) if d in missing_dates}
         self.missing = set(self.missing_to_dates)
 

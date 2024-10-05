@@ -5,10 +5,17 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
+import datetime
+import json
 import logging
 import os
+import pprint
 import warnings
 from functools import cached_property
+
+from anemoi.utils.dates import frequency_to_seconds
+from anemoi.utils.dates import frequency_to_string
+from anemoi.utils.dates import frequency_to_timedelta
 
 LOG = logging.getLogger(__name__)
 
@@ -16,13 +23,23 @@ LOG = logging.getLogger(__name__)
 class Dataset:
     arguments = {}
 
+    def mutate(self) -> "Dataset":
+        """
+        Give an opportunity to a subclass to return a new Dataset
+        object of a different class, if needed.
+        """
+        return self
+
+    def swap_with_parent(self, parent):
+        return parent
+
     @cached_property
     def _len(self):
         return len(self)
 
     def _subset(self, **kwargs):
         if not kwargs:
-            return self
+            return self.mutate()
 
         if "start" in kwargs or "end" in kwargs:
             start = kwargs.pop("start", None)
@@ -30,37 +47,58 @@ class Dataset:
 
             from .subset import Subset
 
-            return Subset(self, self._dates_to_indices(start, end), dict(start=start, end=end))._subset(**kwargs)
+            return (
+                Subset(self, self._dates_to_indices(start, end), dict(start=start, end=end))._subset(**kwargs).mutate()
+            )
 
         if "frequency" in kwargs:
             from .subset import Subset
 
+            if "interpolate_frequency" in kwargs:
+                raise ValueError("Cannot use both `frequency` and `interpolate_frequency`")
+
             frequency = kwargs.pop("frequency")
-            return Subset(self, self._frequency_to_indices(frequency), dict(frequency=frequency))._subset(**kwargs)
+            return (
+                Subset(self, self._frequency_to_indices(frequency), dict(frequency=frequency))
+                ._subset(**kwargs)
+                .mutate()
+            )
+
+        if "interpolate_frequency" in kwargs:
+            from .interpolate import InterpolateFrequency
+
+            interpolate_frequency = kwargs.pop("interpolate_frequency")
+            return InterpolateFrequency(self, interpolate_frequency)._subset(**kwargs).mutate()
 
         if "select" in kwargs:
             from .select import Select
 
             select = kwargs.pop("select")
-            return Select(self, self._select_to_columns(select), {"select": select})._subset(**kwargs)
+            return Select(self, self._select_to_columns(select), {"select": select})._subset(**kwargs).mutate()
 
         if "drop" in kwargs:
             from .select import Select
 
             drop = kwargs.pop("drop")
-            return Select(self, self._drop_to_columns(drop), {"drop": drop})._subset(**kwargs)
+            return Select(self, self._drop_to_columns(drop), {"drop": drop})._subset(**kwargs).mutate()
 
         if "reorder" in kwargs:
             from .select import Select
 
             reorder = kwargs.pop("reorder")
-            return Select(self, self._reorder_to_columns(reorder), {"reoder": reorder})._subset(**kwargs)
+            return Select(self, self._reorder_to_columns(reorder), {"reoder": reorder})._subset(**kwargs).mutate()
 
         if "rename" in kwargs:
             from .select import Rename
 
             rename = kwargs.pop("rename")
-            return Rename(self, rename)._subset(**kwargs)
+            return Rename(self, rename)._subset(**kwargs).mutate()
+
+        if "rescale" in kwargs:
+            from .rescale import Rescale
+
+            rescale = kwargs.pop("rescale")
+            return Rescale(self, rescale)._subset(**kwargs).mutate()
 
         if "statistics" in kwargs:
             from ..data import open_dataset
@@ -68,20 +106,38 @@ class Dataset:
 
             statistics = kwargs.pop("statistics")
 
-            return Statistics(self, open_dataset(statistics))._subset(**kwargs)
+            return Statistics(self, open_dataset(statistics))._subset(**kwargs).mutate()
 
         if "thinning" in kwargs:
             from .masked import Thinning
 
             thinning = kwargs.pop("thinning")
             method = kwargs.pop("method", "every-nth")
-            return Thinning(self, thinning, method)._subset(**kwargs)
+            return Thinning(self, thinning, method)._subset(**kwargs).mutate()
 
         if "area" in kwargs:
             from .masked import Cropping
 
             bbox = kwargs.pop("area")
-            return Cropping(self, bbox)._subset(**kwargs)
+            return Cropping(self, bbox)._subset(**kwargs).mutate()
+
+        if "missing_dates" in kwargs:
+            from .missing import MissingDates
+
+            missing_dates = kwargs.pop("missing_dates")
+            return MissingDates(self, missing_dates)._subset(**kwargs).mutate()
+
+        if "skip_missing_dates" in kwargs:
+            from .missing import SkipMissingDates
+
+            if "expected_access" not in kwargs:
+                raise ValueError("`expected_access` is required with `skip_missing_dates`")
+
+            skip_missing_dates = kwargs.pop("skip_missing_dates")
+            expected_access = kwargs.pop("expected_access")
+
+            if skip_missing_dates:
+                return SkipMissingDates(self, expected_access)._subset(**kwargs).mutate()
 
         # Keep last
         if "shuffle" in kwargs:
@@ -90,15 +146,14 @@ class Dataset:
             shuffle = kwargs.pop("shuffle")
 
             if shuffle:
-                return Subset(self, self._shuffle_indices(), dict(shuffle=True))._subset(**kwargs)
+                return Subset(self, self._shuffle_indices(), dict(shuffle=True))._subset(**kwargs).mutate()
 
         raise NotImplementedError("Unsupported arguments: " + ", ".join(kwargs))
 
     def _frequency_to_indices(self, frequency):
-        from .misc import _frequency_to_hours
 
-        requested_frequency = _frequency_to_hours(frequency)
-        dataset_frequency = _frequency_to_hours(self.frequency)
+        requested_frequency = frequency_to_seconds(frequency)
+        dataset_frequency = frequency_to_seconds(self.frequency)
         assert requested_frequency % dataset_frequency == 0
         # Question: where do we start? first date, or first date that is a multiple of the frequency?
         step = requested_frequency // dataset_frequency
@@ -171,37 +226,71 @@ class Dataset:
         import anemoi
 
         def tidy(v):
-            if isinstance(v, (list, tuple)):
+            if isinstance(v, (list, tuple, set)):
                 return [tidy(i) for i in v]
             if isinstance(v, dict):
                 return {k: tidy(v) for k, v in v.items()}
             if isinstance(v, str) and v.startswith("/"):
                 return os.path.basename(v)
+            if isinstance(v, datetime.datetime):
+                return v.isoformat()
+            if isinstance(v, datetime.date):
+                return v.isoformat()
+            if isinstance(v, datetime.timedelta):
+                return frequency_to_string(v)
+
+            if isinstance(v, Dataset):
+                # That can happen in the `arguments`
+                # if a dataset is passed as an argument
+                return repr(v)
+
+            if isinstance(v, slice):
+                return (v.start, v.stop, v.step)
+
             return v
 
-        return tidy(
-            dict(
-                version=anemoi.datasets.__version__,
-                shape=self.shape,
-                arguments=self.arguments,
-                specific=self.metadata_specific(),
-                frequency=self.frequency,
-                variables=self.variables,
-                start_date=self.dates[0].astype(str),
-                end_date=self.dates[-1].astype(str),
-            )
+        md = dict(
+            version=anemoi.datasets.__version__,
+            arguments=self.arguments,
+            **self.dataset_metadata(),
+        )
+
+        try:
+            return json.loads(json.dumps(tidy(md)))
+        except Exception:
+            LOG.exception("Failed to serialize metadata")
+            pprint.pprint(md)
+
+            raise
+
+    @property
+    def start_date(self):
+        return self.dates[0]
+
+    @property
+    def end_date(self):
+        return self.dates[-1]
+
+    def dataset_metadata(self):
+        return dict(
+            specific=self.metadata_specific(),
+            frequency=self.frequency,
+            variables=self.variables,
+            shape=self.shape,
+            start_date=self.start_date.astype(str),
+            end_date=self.end_date.astype(str),
         )
 
     def metadata_specific(self, **kwargs):
         action = self.__class__.__name__.lower()
-        assert isinstance(self.frequency, int), (self.frequency, self, action)
+        # assert isinstance(self.frequency, datetime.timedelta), (self.frequency, self, action)
         return dict(
             action=action,
             variables=self.variables,
             shape=self.shape,
-            frequency=self.frequency,
-            start_date=self.dates[0].astype(str),
-            end_date=self.dates[-1].astype(str),
+            frequency=frequency_to_string(frequency_to_timedelta(self.frequency)),
+            start_date=self.start_date.astype(str),
+            end_date=self.end_date.astype(str),
             **kwargs,
         )
 
@@ -219,10 +308,6 @@ class Dataset:
         for n in overriden:
             if n.startswith("_") and not n.startswith("__"):
                 warnings.warn(f"Private method {n} is overriden in {ds.__class__.__name__}")
-
-        # for n in ('metadata_specific', 'tree', 'source'):
-        #     if n not in overriden:
-        #         warnings.warn(f"Method {n} is not overriden in {ds.__class__.__name__}")
 
     def _repr_html_(self):
         return self.tree().html()

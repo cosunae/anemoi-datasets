@@ -9,6 +9,7 @@ import logging
 from functools import cached_property
 
 import numpy as np
+from anemoi.utils.dates import frequency_to_timedelta
 
 from .debug import Node
 from .debug import Source
@@ -23,13 +24,51 @@ from .indexing import update_tuple
 LOG = logging.getLogger(__name__)
 
 
+def _default(a, b, dates):
+    return [a, b]
+
+
+def _start(a, b, dates):
+    from .misc import as_first_date
+
+    c = as_first_date(a, dates)
+    d = as_first_date(b, dates)
+    if c < d:
+        return b
+    else:
+        return a
+
+
+def _end(a, b, dates):
+    from .misc import as_last_date
+
+    c = as_last_date(a, dates)
+    d = as_last_date(b, dates)
+    if c < d:
+        return a
+    else:
+        return b
+
+
+def _combine_reasons(reason1, reason2, dates):
+
+    reason = reason1.copy()
+    for k, v in reason2.items():
+        if k not in reason:
+            reason[k] = v
+        else:
+            func = globals().get(f"_{k}", _default)
+            reason[k] = func(reason[k], v, dates)
+    return reason
+
+
 class Subset(Forwards):
     """Select a subset of the dates."""
 
     def __init__(self, dataset, indices, reason):
         while isinstance(dataset, Subset):
             indices = [dataset.indices[i] for i in indices]
-            reason = {**reason, **dataset.reason}
+            reason = _combine_reasons(reason, dataset.reason, dataset.dates)
             dataset = dataset.dataset
 
         self.dataset = dataset
@@ -38,6 +77,12 @@ class Subset(Forwards):
 
         # Forward other properties to the super dataset
         super().__init__(dataset)
+
+    def clone(self, dataset):
+        return self.__class__(dataset, self.indices, self.reason).mutate()
+
+    def mutate(self):
+        return self.forward.swap_with_parent(parent=self)
 
     @debug_indexing
     def __getitem__(self, n):
@@ -66,10 +111,8 @@ class Subset(Forwards):
     @expand_list_indexing
     def _get_tuple(self, n):
         index, changes = index_to_slices(n, self.shape)
-        # print('INDEX', index, changes)
         indices = [self.indices[i] for i in range(*index[0].indices(self._len))]
         indices = make_slice_or_index_from_list_or_tuple(indices)
-        # print('INDICES', indices)
         index, _ = update_tuple(index, 0, indices)
         result = self.dataset[index]
         result = apply_index_to_slices_changes(result, changes)
@@ -89,8 +132,7 @@ class Subset(Forwards):
     @cached_property
     def frequency(self):
         dates = self.dates
-        delta = dates[1].astype(object) - dates[0].astype(object)
-        return int(delta.total_seconds() / 3600)
+        return frequency_to_timedelta(dates[1].astype(object) - dates[0].astype(object))
 
     def source(self, index):
         return Source(self, index, self.forward.source(index))
